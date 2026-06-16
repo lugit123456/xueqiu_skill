@@ -12,6 +12,7 @@ agent 调用本模块完成：
 3. 立即对该博主启动一次 mini 抓取（复用 XueqiuSmartSkill.crawl_single_blogger）
 4. 把抓取回执（含最近 5 条帖子预览）透传给 agent，agent 可立即回答"博主都说了什么"
 5. 用户事后追问时，可调用 query_recent_posts() 直接查 DB 而不重新抓取
+6. **登录态失效时自动弹浏览器让用户登录 + 重试抓取**（用户不会自己跑 --debug）
 
 入口函数（按调用顺序）：
 
@@ -364,17 +365,17 @@ def _format_recent_preview_line(recent_posts: list) -> str:
 def _format_diagnosis_line(diagnosis: dict) -> str:
     """把抓取诊断信息格式化为单行中文摘要，附加到 message 末尾。
     只在 diagnosis 非空（抓取失败）时返回非空字符串。
-    登录态失效时优先输出明确指引（让 agent 知道让用户重登录）。"""
+    登录态失效时优先输出"请帮我跑"指引（让 agent 收到后自己用 bash 工具触发登录）。"""
     if not diagnosis:
         return ""
-    # 优先：登录态失效 → 明确指引
+    # 登录态失效 → 明确指引（让 agent 知道要触发"自动登录"协议）
     if diagnosis.get("need_user_login"):
         cmd = diagnosis.get("relogin_command",
                             "python3 xueqiu_random_trigger.py --debug")
         return (
-            f"\n🔐 检测到登录态失效。请运行：\n"
+            f"\n🔐 检测到登录态失效。请帮我跑：\n"
             f"   `{cmd}`\n"
-            f"   重新登录后，**重新发送刚才的链接/关键词**给我。"
+            f"   等您登录完成后，我会**自动重新抓取**。"
         )
     # 普通诊断行
     status = diagnosis.get("fetch_status", "unknown")
@@ -441,9 +442,10 @@ def add_blogger_by_keyword(keyword: str, auto_crawl_single: bool = True) -> dict
         u = users[0]
         uid, name = int(u["id"]), u.get("screen_name", str(u["id"]))
         record = add_blogger_by_uid(uid, name, auto_crawl=auto_crawl_single)
+        diagnosis = record.get("diagnosis", {})
+
         new_count = record.get("crawl_result", 0)
         recent_posts = record.get("recent_posts", [])
-        diagnosis = record.get("diagnosis", {})
         preview_line = _format_recent_preview_line(recent_posts)
         diag_line = _format_diagnosis_line(diagnosis)
         return {
@@ -487,9 +489,10 @@ def add_blogger_from_user_input(user_text: str, auto_crawl: bool = True) -> dict
     if uid is not None:
         logger.info(f"🔗 识别到雪球链接: {matched} → UID={uid}")
         record = add_blogger_by_uid(uid, screen_name=f"UID:{uid}", auto_crawl=auto_crawl)
+        diagnosis = record.get("diagnosis", {})
+
         new_count = record.get("crawl_result", 0)
         recent_posts = record.get("recent_posts", [])
-        diagnosis = record.get("diagnosis", {})
         preview_line = _format_recent_preview_line(recent_posts)
         diag_line = _format_diagnosis_line(diagnosis)
         return {
