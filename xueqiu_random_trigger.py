@@ -108,4 +108,10 @@ class XueqiuRandomTrigger:
 
 
 if __name__ == "__main__":
-    XueqiuRandomTrigger().run()
+    import argparse
+    parser = argparse.ArgumentParser(
+        description="雪球舆情巡检触发器。--debug 走有头模式跳过延迟与静默期，供首次登录使用。")
+    parser.add_argument("--debug", action="store_true",
+                        help="有头模式 + 跳过静默期（用于首次登录）")
+    args = parser.parse_args()
+    XueqiuRandomTrigger().run(debug_mode=args.debug)

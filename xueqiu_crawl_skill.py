@@ -162,17 +162,37 @@ class XueqiuSmartSkill:
             logging.error(f"❌ 飞书告警发送失败: {e}")
 
     def _fetch_inside_page(self, page, uid, p_num):
+        """
+        在浏览器内 fetch 雪球动态时间线 API。
+        返回结构化 dict，便于调用方定位失败原因：
+            成功：       {"ok": True, "data": <statuses array>}
+            HTTP 非 200：{"ok": False, "status": <int>, "body_preview": <str 前 200 字>}
+            JS 异常：   {"ok": False, "status": -1, "error": <str>}
+            Python 异常：{"ok": False, "status": -1, "error": "page.evaluate 异常: ..."}
+        """
         script = """
         async (args) => {
             const [u, p] = args;
-            const r = await fetch(`/v4/statuses/user_timeline.json?page=${p}&user_id=${u}`);
-            return r.status === 200 ? await r.json() : null;
+            try {
+                const r = await fetch(`/v4/statuses/user_timeline.json?page=${p}&user_id=${u}`);
+                if (r.status === 200) {
+                    return { ok: true, data: await r.json() };
+                }
+                let body = '';
+                try { body = (await r.text()).slice(0, 200); } catch(e) {}
+                return { ok: false, status: r.status, body_preview: body };
+            } catch (e) {
+                return { ok: false, status: -1, error: String(e) };
+            }
         }
         """
         try:
-            return page.evaluate(script, [str(uid), p_num])
-        except:
-            return None
+            result = page.evaluate(script, [str(uid), p_num])
+            if not isinstance(result, dict):
+                return {"ok": False, "status": -1, "error": "evaluate 返回非 dict"}
+            return result
+        except Exception as e:
+            return {"ok": False, "status": -1, "error": f"page.evaluate 异常: {e}"}
 
     def _fetch_long_post(self, page, uid, status_id):
         script = """
@@ -240,6 +260,198 @@ class XueqiuSmartSkill:
             raise e
         finally:
             conn.close()
+
+    def crawl_single_blogger(self, uid, screen_name, max_pages=3, page_wait=(8, 14),
+                             recent_posts_limit=5):
+        """
+        单博主 mini 抓取：只针对一个博主跑 1~N 页，追到最新动态。
+        由 xueqiu_add_blogger.py 在用户主动添加博主时调用，避免触发 execute() 扫全表。
+
+        返回值（dict）:
+            {
+                "new_count": int,          # 本轮新插入数据库的条数
+                "fetched_pages": int,      # 实际翻过的页数
+                "recent_posts": [           # 本次抓到的帖子（去重，最多 N 条）
+                    {
+                        "id": int,
+                        "content_preview": str,   # 清洗后正文前 200 字
+                        "comment_time": str,      # 'YYYY-MM-DD HH:MM:SS'
+                        "stock_codes": str,
+                        "stock_names": str,
+                    },
+                    ...
+                ],
+                "diagnosis": {               # 抓取失败时附带诊断信息；成功时为 {}
+                    "fetch_status": int|str,
+                    "fetch_body_preview": str,
+                    "fetch_error": str,
+                    "cookies": [
+                        {"name": str, "value_prefix": str, "expires": int},
+                        ...
+                    ]
+                }
+            }
+        失败时返回字符串（与 execute() 错误风格一致）。
+        """
+        env_path = os.path.join(os.path.dirname(__file__), ".env")
+        if not os.path.exists(env_path):
+            return f"⚠️ 缺少配置文件：请确保在 {env_path} 路径下存在 .env 文件。"
+
+        load_dotenv(env_path)
+        is_headless = os.getenv("BROWSER_HEADLESS", "True").lower() == "true"
+
+        logging.info(
+            f"🎯 [SingleBlogger] 启动 mini 抓取: {screen_name}(UID={uid}) | "
+            f"最多 {max_pages} 页 | 无头: {is_headless}")
+
+        result = {
+            "new_count": 0,
+            "fetched_pages": 0,
+            "recent_posts": [],
+            "diagnosis": {},
+        }
+        seen_ids = set()
+        collected_statuses = []   # 临时缓存本轮抓到的 statuses（去重后用于 recent_posts）
+
+        with sync_playwright() as p:
+            context = p.chromium.launch_persistent_context(
+                user_data_dir=self.user_data_dir,
+                headless=is_headless,
+                args=["--disable-blink-features=AutomationControlled"]
+            )
+            page = context.new_page()
+
+            if is_headless and not os.path.exists(os.path.join(self.user_data_dir, "Default")):
+                context.close()
+                return "🚨 【环境未初始化】检测到你从未登录过。请对我说：『开启调试模式运行雪球采集』，在窗口中完成登录。"
+
+            try:
+                try:
+                    page.goto(f"https://xueqiu.com/u/{uid}", wait_until="domcontentloaded", timeout=25000)
+                except Exception:
+                    pass
+
+                total_new = 0
+                for curr_page in range(1, max_pages + 1):
+                    fetch_res = self._fetch_inside_page(page, uid, curr_page)
+                    if not isinstance(fetch_res, dict) or not fetch_res.get("ok"):
+                        result["diagnosis"]["fetch_status"] = (fetch_res or {}).get("status", "unknown")
+                        result["diagnosis"]["fetch_body_preview"] = (fetch_res or {}).get("body_preview", "")
+                        result["diagnosis"]["fetch_error"] = (fetch_res or {}).get("error", "")
+
+                        # 登录态失效检测：雪球 error_code 10022 / 10021 等常见文案
+                        body_preview = result["diagnosis"]["fetch_body_preview"] or ""
+                        if ("请登录" in body_preview
+                                or "未登录" in body_preview
+                                or "token" in body_preview.lower()):
+                            result["diagnosis"]["need_user_login"] = True
+                            result["diagnosis"]["relogin_command"] = (
+                                "python3 xueqiu_random_trigger.py --debug"
+                            )
+
+                        logging.warning(
+                            f"⚠️ [SingleBlogger] {screen_name} 第 {curr_page} 页 fetch 失败 | "
+                            f"status={result['diagnosis']['fetch_status']} | "
+                            f"err={result['diagnosis']['fetch_error']} | "
+                            f"body={result['diagnosis']['fetch_body_preview'][:120]}")
+                        break
+
+                    data = fetch_res.get("data") or {}
+                    statuses = data.get("statuses", [])
+                    if not statuses:
+                        logging.info(f"📭 [SingleBlogger] {screen_name} 第 {curr_page} 页已无内容，抓取结束。")
+                        break
+
+                    # 长文抓取逻辑与 execute() 保持一致
+                    for s in statuses:
+                        if str(s.get("type")) == "3" or (s.get("title") and not s.get("text")):
+                            logging.info(f"🔎 发现长文《{s.get('title')}》，正在向下抓取详情...")
+                            long_text = self._fetch_long_post(page, uid, s['id'])
+                            if long_text:
+                                long_text = re.sub(r'</?(p|br|div)[^>]*>', '\n', long_text, flags=re.IGNORECASE)
+                                clean_text = re.sub(r'<[^>]+>', '', long_text)
+                                s['text'] = re.sub(r'\n{2,}', '\n', clean_text).strip()
+                            else:
+                                s['text'] = s.get('description', '')
+                            time.sleep(random.uniform(1.0, 2.5))
+
+                    # 收集本轮 statuses（去重），用于构造 recent_posts
+                    for s in statuses:
+                        sid = s.get("id")
+                        if sid is None or sid in seen_ids:
+                            continue
+                        seen_ids.add(sid)
+                        collected_statuses.append(s)
+
+                    new_count = self._save_data(statuses)
+                    total_new += new_count
+                    logging.info(
+                        f"📑 [SingleBlogger] {screen_name} 第 {curr_page} 页："
+                        f"获取 {len(statuses)} 条，入库 {new_count} 条。")
+
+                    # 哨兵：增量模式下首页无新数据即停
+                    if curr_page == 1 and new_count == 0:
+                        logging.info(f"🛡️ [SingleBlogger] {screen_name} 首页无新增动态，无需继续翻页。")
+                        break
+
+                    if curr_page < max_pages:
+                        wait_time = random.uniform(*page_wait)
+                        time.sleep(wait_time)
+            finally:
+                # 在 context 关闭前取 cookie 诊断信息
+                try:
+                    all_cookies = context.cookies()      # 不带 url 参数，客户端按 domain 过滤
+                    key_names = {"xq_a_token", "xqat", "xq_r_token", "u", "s", "xq_id_token"}
+                    result["diagnosis"]["cookies"] = [
+                        {
+                            "name": c["name"],
+                            "value_prefix": c["value"][:30],
+                            "expires": c.get("expires", -1),
+                        }
+                        for c in all_cookies
+                        if c["name"] in key_names
+                        and "xueqiu.com" in c.get("domain", "")
+                    ]
+                except Exception as e:
+                    result["diagnosis"]["cookies_error"] = str(e)
+                context.close()
+
+            self._mark_task_status(uid, 2, 0)
+            self._update_last_time(uid)
+            self._sync_total_count(uid)
+
+            # 构造 recent_posts：按 created_at 倒序，截前 N 条
+            collected_statuses.sort(key=lambda x: x.get("created_at", 0), reverse=True)
+            for s in collected_statuses[:recent_posts_limit]:
+                text = (s.get("text") or "").strip()
+                if not text:
+                    text = s.get("description") or ""
+                text = re.sub(r'\s+', ' ', text)  # 折叠空白
+                if len(text) > 200:
+                    text = text[:200] + "…"
+
+                codes = ",".join(s.get("stockCorrelation", []) or [])
+                names = ",".join(re.findall(r'\$([^$()]+)\((?:SH|SZ|HK)?\d{5,6}\)\$', s.get("text", "") or ""))
+                try:
+                    comment_time = datetime.fromtimestamp(
+                        s["created_at"] / 1000).strftime('%Y-%m-%d %H:%M:%S')
+                except Exception:
+                    comment_time = ""
+
+                result["recent_posts"].append({
+                    "id": s.get("id"),
+                    "content_preview": text,
+                    "comment_time": comment_time,
+                    "stock_codes": codes,
+                    "stock_names": names,
+                })
+
+            result["new_count"] = total_new
+            result["fetched_pages"] = curr_page  # 实际跑过的最大页码
+            logging.info(
+                f"🏁 [SingleBlogger] {screen_name} 抓取完成，本轮共入库 {total_new} 条新动态，"
+                f"回执含 {len(result['recent_posts'])} 条 recent_posts。")
+            return result
 
     def execute(self, run_minutes=None, debug_mode=False):
         env_path = os.path.join(os.path.dirname(__file__), ".env")
